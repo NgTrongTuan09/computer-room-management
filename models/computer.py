@@ -18,3 +18,4 @@ class Computer:
         self.status = status
         self.ping = ping
         self.last_heartbeat = time.time()
+        self.is_blocked = False

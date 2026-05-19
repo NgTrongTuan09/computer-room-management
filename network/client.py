@@ -8,7 +8,7 @@ Improvements:
 - Thread-safe operations
 - Graceful shutdown
 """
-
+import gc
 import atexit
 import pickle
 import platform
@@ -22,6 +22,8 @@ import mss
 import cv2
 import numpy as np
 import os
+# from PIL import Image
+# import io
 from utils.logger import LoggerSetup
 
 logger = LoggerSetup.get_logger(__name__)
@@ -55,91 +57,93 @@ class SocketClient:
         self.is_running = True
         self.reconnect_attempts = 0
 
-        self.client_socket = socket.socket(
-            socket.AF_INET,
-            socket.SOCK_STREAM
-        )
 
-        self.screen_socket = socket.socket(
-            socket.AF_INET,
-            socket.SOCK_STREAM
-        )
+        
+        # self.client_socket = socket.socket(
+        #     socket.AF_INET,
+        #     socket.SOCK_STREAM
+        # )
 
-        self.file_socket = socket.socket(
-            socket.AF_INET,
-            socket.SOCK_STREAM
-        )
+        # self.screen_socket = socket.socket(
+        #     socket.AF_INET,
+        #     socket.SOCK_STREAM
+        # )
+
+        # self.file_socket = socket.socket(
+        #     socket.AF_INET,
+        #     socket.SOCK_STREAM
+        # )
 
         self.client_id = str(uuid.uuid4())
-        
+        self.session_active = False
+
         logger.info(f"SocketClient initialized - Client ID: {self.client_id}")
         logger.info(f"Target server: {host}:{port}")
         
         atexit.register(self.cleanup)
+    
+    def start_forever(self):
+        """Vòng lặp chính luôn cố gắng kết nối lại với server"""
+        while True:
+            try:
+                if self.connect():
+                    self.session_active = True
+                    self.send_computer_info()
+                    self.start_heartbeat()
+                    self.start_screen_stream()
+                    self.start_receive_loop()
+
+                    logger.info("Đã kết nối hoàn tất, đang giữ luồng hoạt động...")
+                    # Giữ luồng chính sống chừng nào phiên còn đang active
+                    while self.session_active:
+                        time.sleep(1)
+                
+                # Nếu kết nối thất bại hoặc bị ngắt, đợi 5s rồi thử lại
+                logger.info("Đợi 5 giây trước khi thử kết nối lại...")
+                time.sleep(5)
+            except Exception as e:
+                logger.error(f"Lỗi ở vòng lặp chính: {e}")
+                time.sleep(5)
+
 
     def connect(self):
-        """
-        Connect to server with retry logic
+        """Khởi tạo lại socket và kết nối"""
+        try:
+            # BẮT BUỘC KHỞI TẠO LẠI SOCKET Ở ĐÂY
+            self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.screen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.file_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+            logger.info(f"Đang kết nối tới {self.host}:{self.port}...")
+            
+            self.client_socket.connect((self.host, self.port))
+            self.client_socket.settimeout(SOCKET_TIMEOUT)
+
+            self.screen_socket.connect((self.host, 5001))
+            self.screen_socket.settimeout(SOCKET_TIMEOUT)
+
+            self.file_socket.connect((self.host, 5002))
+            self.file_socket.settimeout(SOCKET_TIMEOUT)
+
+            # Đăng ký với file server
+            message = f"FILE_CONNECT|{self.client_id}"
+            self.file_socket.send(message.encode())
+
+            # Start file receiver thread
+            threading.Thread(
+                target=self.receive_files,
+                daemon=True,
+                name="FileReceiver"
+            ).start()
+
+            self.create_virtual_drive()
+            return True
+
+        except Exception as e:
+            logger.error(f"Kết nối thất bại: {e}")
+            self._close_sockets()
+            return False
         
-        Returns:
-            bool: True if connected successfully
-        """
-        for attempt in range(RECONNECT_ATTEMPTS):
-            try:
-                logger.info(
-                    f"Connection attempt {attempt + 1}/{RECONNECT_ATTEMPTS} "
-                    f"to {self.host}:{self.port}"
-                )
-                
-                # Connect main socket
-                self.client_socket.connect((self.host, self.port))
-                self.client_socket.settimeout(SOCKET_TIMEOUT)
-                logger.info("Main socket connected")
-
-                # Connect screen socket
-                self.screen_socket.connect((self.host, 5001))
-                self.screen_socket.settimeout(SOCKET_TIMEOUT)
-                logger.info("Screen socket connected")
-
-                # Connect file socket
-                self.file_socket.connect((self.host, 5002))
-                self.file_socket.settimeout(SOCKET_TIMEOUT)
-                logger.info("File socket connected")
-
-                # Register with file server
-                message = f"FILE_CONNECT|{self.client_id}"
-                self.file_socket.send(message.encode())
-                logger.info("File connection registered")
-
-                # Start receive threads
-                threading.Thread(
-                    target=self.receive_files,
-                    daemon=True,
-                    name="FileReceiver"
-                ).start()
-
-                # Create virtual drive (Windows only)
-                self.create_virtual_drive()
-
-                logger.info("Client connected successfully to server")
-                self.reconnect_attempts = 0
-                return True
-
-            except socket.error as e:
-                logger.error(f"Connection failed (attempt {attempt + 1}): {e}")
-                
-                if attempt < RECONNECT_ATTEMPTS - 1:
-                    logger.info(f"Retrying in {RECONNECT_DELAY} seconds...")
-                    time.sleep(RECONNECT_DELAY)
-                else:
-                    logger.error("Failed to connect after all attempts")
-                    return False
-
-            except Exception as e:
-                logger.error(f"Unexpected error during connection: {e}", exc_info=True)
-                return False
-
-        return False
 
     def send_computer_info(self):
         """Send computer information to server"""
@@ -184,12 +188,13 @@ class SocketClient:
         """
         Receive and handle commands from server
         """
-        while self.is_running:
+        while self.session_active:
             try:
                 data = self.client_socket.recv(DEFAULT_BUFFER_SIZE).decode()
 
                 if not data:
                     logger.warning("Server closed connection")
+                    self.session_active = False
                     break
 
                 logger.debug(f"Server command received: {data}")
@@ -200,6 +205,7 @@ class SocketClient:
                 continue
             except Exception as e:
                 logger.error(f"Receive loop error: {e}", exc_info=True)
+                self.session_active = False
                 break
 
     def handle_command(self, data):
@@ -230,7 +236,7 @@ class SocketClient:
         """
         Send heartbeat/ping to server periodically
         """
-        while self.is_running:
+        while self.session_active:
             try:
                 message = f"PING|{self.client_id}"
                 self.client_socket.send(message.encode())
@@ -248,7 +254,6 @@ class SocketClient:
     def capture_screen(self):
         """
         Capture current screen
-        
         Returns:
             bytes: Pickled frame data
         """
@@ -256,18 +261,19 @@ class SocketClient:
             with mss.mss() as sct:
                 monitor = sct.monitors[1]
                 screenshot = sct.grab(monitor)
-
                 img = np.array(screenshot)
                 img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-
+                
+                # --- THÊM 3 DÒNG NÀY ĐỂ THU NHỎ ẢNH (TỐI ƯU CHO 20 MÁY) ---
+                width = 1024
+                height = int(img.shape[0] * (width / img.shape[1]))
+                img = cv2.resize(img, (width, height), interpolation=cv2.INTER_AREA)
+                # ---------------------------------------------------------
+                
                 _, buffer = cv2.imencode(
-                    ".jpg",
-                    img,
-                    [int(cv2.IMWRITE_JPEG_QUALITY), 50]
+                    ".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 50]
                 )
-
                 return pickle.dumps(buffer)
-
         except Exception as e:
             logger.error(f"Screen capture error: {e}")
             return None
@@ -282,48 +288,86 @@ class SocketClient:
         logger.info("Screen streaming thread started")
 
     def screen_stream_loop(self):
-        """
-        Continuously capture and send screen to server
-        """
-        consecutive_errors = 0
-        max_errors = 5
+        """Stream screen frames to server với cơ chế tối ưu RAM tối đa"""
+        logger.info("Screen stream loop started")
+        
+        # KHỞI TẠO MSS DUY NHẤT 1 LẦN TẠI ĐÂY (Tránh rò rỉ RAM và giảm 80% CPU)
+        with mss.mss() as sct:
+            monitor = sct.monitors[1]
+            frame_count = 0  # Biến đếm số khung hình
+            
+            while self.is_running:
+                try:
+                    if not self.session_active:
+                        time.sleep(1)
+                        continue
 
-        while self.is_running:
-            try:
-                frame = self.capture_screen()
+                    # Truyền thẳng sct và monitor vào hàm để dùng lại bộ nhớ cũ
+                    frame_data = self.capture_screen_optimized(sct, monitor)
+                    
+                    if frame_data:
+                        # Gửi dữ liệu qua socket
+                        self.screen_socket.sendall(
+                            struct.pack("Q", len(frame_data)) + frame_data
+                        )
+                        # XÓA NGAY LẬP TỨC biến frame_data sau khi gửi xong
+                        del frame_data 
 
-                if not frame:
-                    consecutive_errors += 1
-                    if consecutive_errors >= max_errors:
-                        logger.error("Too many screen capture errors, stopping stream")
-                        break
+                    frame_count += 1
+                    
+                    # CỨ MỖI 50 FRAMES (~10 giây), ÉP PYTHON KHỞI ĐỘNG TRÌNH DỌN RAM
+                    if frame_count % 50 == 0:
+                        gc.collect()  # Thu hồi toàn bộ ô nhớ treo của OpenCV/Numpy
+                        frame_count = 0
+
                     time.sleep(SCREEN_CAPTURE_INTERVAL)
-                    continue
 
-                data = pickle.dumps((self.client_id, frame))
-                message = struct.pack("Q", len(data)) + data
-
-                self.screen_socket.sendall(message)
-                consecutive_errors = 0
-
-                time.sleep(SCREEN_CAPTURE_INTERVAL)
-
-            except socket.error as e:
-                logger.error(f"Screen stream socket error: {e}")
-                consecutive_errors += 1
-                break
-            except Exception as e:
-                logger.error(f"Screen stream error: {e}")
-                consecutive_errors += 1
-                if consecutive_errors >= max_errors:
+                except Exception as e:
+                    logger.error(f"Screen stream loop error: {e}")
+                    self.session_active = False
                     break
-                time.sleep(SCREEN_CAPTURE_INTERVAL)
+
+    def capture_screen_optimized(self, sct, monitor):
+        """
+        Chụp và xử lý màn hình tối ưu hóa bộ nhớ đệm
+        """
+        try:
+            screenshot = sct.grab(monitor)
+            img = np.array(screenshot)
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            
+            width = 1024
+            height = int(img.shape[0] * (width / img.shape[1]))
+            small_img = cv2.resize(img, (width, height), interpolation=cv2.INTER_AREA)
+            
+            _, buffer = cv2.imencode(
+                ".jpg", small_img, [int(cv2.IMWRITE_JPEG_QUALITY), 50]
+            )
+            
+            # SỬA Ở ĐÂY: Gói (dump) 2 lần để khớp với đầu đọc của Server
+            frame_bytes = pickle.dumps(buffer)
+            data = pickle.dumps((self.client_id, frame_bytes))
+            
+            del screenshot
+            del img
+            del small_img
+            del buffer
+            
+            return data
+            
+        except Exception as e:
+            logger.error(f"Screen capture error: {e}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Screen capture error: {e}")
+            return None
 
     def receive_files(self):
         """
         Receive files from server
         """
-        while self.is_running:
+        while self.session_active:
             try:
                 header = (
                     self.file_socket.recv(FILE_HEADER_SIZE)
@@ -485,24 +529,24 @@ class SocketClient:
             logger.error(f"Error removing virtual drive: {e}")
 
     def disconnect(self):
-        """
-        Disconnect from server and cleanup
-        """
+        """Ngắt kết nối hiện tại (sẽ tự động kích hoạt vòng lặp reconnect ở start_forever)"""
         logger.info("Client disconnect initiated")
-        self.is_running = False
-
+        self.session_active = False # Đổi cờ để ngưng các luồng
+        self._close_sockets()
+        
         try:
             self.remove_virtual_drive()
         except:
             pass
 
-        try:
-            self.client_socket.close()
-            self.screen_socket.close()
-            self.file_socket.close()
-            logger.info("All sockets closed")
-        except:
-            pass
+    def _close_sockets(self):
+        """Hàm phụ trợ để đóng rạch sẽ sockets"""
+        try: self.client_socket.close() 
+        except: pass
+        try: self.screen_socket.close() 
+        except: pass
+        try: self.file_socket.close() 
+        except: pass
 
     def cleanup(self):
         """Cleanup on exit"""

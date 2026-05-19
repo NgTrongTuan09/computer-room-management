@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-"""
+""" 
+19/5
 Main GUI Application - Phần mềm quản lý phòng máy tính
 Improvements:
 - Added comprehensive logging
@@ -45,6 +46,9 @@ class FileTransferSignals(QtCore.QObject):
     """Signals for file transfer progress"""
     progress = pyqtSignal(str, str, float)  # client_id, filename, progress
 
+class ServerSignals(QtCore.QObject):
+    client_status_changed = pyqtSignal() # Tín hiệu làm mới bảng
+    frame_received = pyqtSignal(str, object)
 
 class MainWindow(QMainWindow):
     """
@@ -74,6 +78,10 @@ class MainWindow(QMainWindow):
         self.file_signals = FileTransferSignals()
         self.file_signals.progress.connect(self.on_file_progress)
 
+        self.signals = ServerSignals()
+        self.signals.client_status_changed.connect(self.refresh_table)
+        self.signals.frame_received.connect(self.update_screen_ui)
+
         # Progress dialogs for file transfers
         self.progress_dialogs = {}
 
@@ -94,7 +102,7 @@ class MainWindow(QMainWindow):
         self.screen_buffers = {}
         self.monitor_labels = {}
 
-        self.refresh_table()
+        self.signals.client_status_changed.emit()
         self.start_timeout_checker()
 
         self.ui.computer_card.hide()
@@ -174,24 +182,20 @@ class MainWindow(QMainWindow):
             self.ui.tableWidget.setItem(row, col, item)
 
         # Disconnect button
-        btn = QPushButton("Ngắt kết nối")
-        btn.clicked.connect(lambda _, c=computer: self.disconnect_client(c))
-        btn.setStyleSheet("""
-            QPushButton{
-                background-color:#2563EB;
-                color:white;
-                border:none;
-                padding:6px 10px;
-                border-radius:8px;
-                font-weight: bold;
-            }
-            QPushButton:hover{
-                background-color:#3B82F6;
-            }
-            QPushButton:pressed{
-                background-color:#1D4ED8;
-            }
-        """)
+        if computer.status == "Online":
+            btn = QPushButton("Ngắt kết nối")
+            btn.clicked.connect(lambda _, c=computer: self.disconnect_client(c))
+            btn.setStyleSheet("""
+                QPushButton{ background-color:#EF4444; color:white; border:none; padding:6px 10px; border-radius:8px; font-weight: bold; }
+                QPushButton:hover{ background-color:#DC2626; }
+            """)
+        else:
+            btn = QPushButton("Kết nối lại")
+            btn.clicked.connect(lambda _, c=computer: self.reconnect_client(c))
+            btn.setStyleSheet("""
+                QPushButton{ background-color:#10B981; color:white; border:none; padding:6px 10px; border-radius:8px; font-weight: bold; }
+                QPushButton:hover{ background-color:#059669; }
+            """)
 
         self.ui.tableWidget.setCellWidget(row, 4, btn)
 
@@ -256,24 +260,29 @@ class MainWindow(QMainWindow):
             username = parts[3]
             os_name = parts[4]
 
-            computer = Computer(
-                client_id=client_id,
-                name=computer_name,
-                ip=ip,
-                status="Online",
-                ping="1ms"
-            )
-
             existing = self.computer_manager.get_computer_by_id(client_id)
+
+            # KIỂM TRA CHẶN: Nếu máy đã có trong data và đang bị block
+            if existing and getattr(existing, 'is_blocked', False):
+                logger.info(f"Từ chối kết nối từ máy đang bị chặn: {computer_name}")
+                self.server.send_command(client_id, "DISCONNECT")
+                return # Thoát luôn, không set nó thành Online
 
             if existing:
                 existing.status = "Online"
                 existing.ping = "1ms"
+                existing.ip = ip # Cập nhật ip phòng trường hợp đổi mạng
             else:
+                computer = Computer(
+                    client_id=client_id,
+                    name=computer_name,
+                    ip=ip,
+                    status="Online",
+                    ping="1ms"
+                )
                 self.computer_manager.add_computer(computer)
 
             logger.info(f"Computer connected: {computer_name} ({ip}) - User: {username} - OS: {os_name}")
-
             QTimer.singleShot(0, self.refresh_table)
 
         except (IndexError, ValueError) as e:
@@ -314,20 +323,35 @@ class MainWindow(QMainWindow):
         """Send disconnect command to client"""
         try:
             result = self.server.send_command(
-                computer.client_id,
-                "DISCONNECT"
+                computer.client_id, "DISCONNECT"
             )
-            
             if result:
                 logger.info(f"Disconnect command sent to: {computer.name}")
                 self.ui.text_log.append(f"Disconnect command sent to {computer.name}")
             else:
                 logger.warning(f"Failed to send disconnect to: {computer.name}")
                 QMessageBox.warning(self, "Lỗi", f"Không thể kết nối tới {computer.name}")
-
         except Exception as e:
             logger.error(f"Error disconnecting client: {e}")
             QMessageBox.critical(self, "Lỗi", f"Lỗi khi ngắt kết nối: {str(e)}")
+
+    # === THÊM CHÍNH XÁC HÀM NÀY VÀO ĐÂY ĐỂ HẾT LỖI ATTRIBUTEERROR ===
+    def reconnect_client(self, computer):
+        """Xử lý khi click kết nối lại máy trạm"""
+        try:
+            self.ui.text_log.append(f"Đang yêu cầu {computer.name} kết nối lại...")
+            # Nếu bạn có thêm cờ chặn computer.is_blocked = False thì xử lý tại đây
+            self.refresh_table()
+        except Exception as e:
+            logger.error(f"Error reconnecting client: {e}")
+
+    def reconnect_client(self, computer):
+        """Xử lý khi bấm nút Kết nối lại"""
+        computer.is_blocked = False # Gỡ chặn
+        self.ui.text_log.append(f"Đã cho phép {computer.name} kết nối lại. Đang đợi...")
+        self.signals.client_status_changed.emit()
+        # Client đang tự động reconnect mỗi 5s, nên sẽ chui vào ngay lập tức sau thao tác này
+
 
     def start_timeout_checker(self):
         """Start timeout checker thread"""
@@ -455,7 +479,9 @@ class MainWindow(QMainWindow):
         """Open monitor page for selected computer"""
         self.selected_computer = computer
         self.switch_page(2, "Điều khiển")
-        self.ui.label_15.setText(f"🖥 {computer.name}")
+        
+        # self.ui.label_15.setText(f"🖥 {computer.name}") 
+        
         logger.info(f"Opened monitor for: {computer.name}")
 
     def update_screen_preview(self, image_data):
@@ -475,7 +501,11 @@ class MainWindow(QMainWindow):
             logger.error(f"Error updating screen preview: {e}")
 
     def on_screen_frame(self, client_id, frame):
-        """Handle received screen frame"""
+        """Hứng frame từ luồng chạy ngầm Server và bắn tín hiệu sang luồng Main UI"""
+        self.signals.frame_received.emit(client_id, frame)
+
+    def update_screen_ui(self, client_id, frame):
+        """Luồng Main UI nhận tín hiệu và cập nhật lên Label"""
         try:
             label = self.monitor_labels.get(client_id)
 
@@ -504,7 +534,7 @@ class MainWindow(QMainWindow):
             )
 
         except Exception as e:
-            logger.error(f"Error processing screen frame: {e}")
+            logger.error(f"Error processing screen frame UI: {e}")
 
     def render_monitor_cards(self):
         """Render monitor cards"""

@@ -3,6 +3,7 @@ from network.client import SocketClient
 
 client = SocketClient("127.0.0.1")
 
+client.start_forever()
 client.connect()
 client.send_computer_info()
 client.start_heartbeat()
