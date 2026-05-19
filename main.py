@@ -9,7 +9,6 @@ Improvements:
 - Status indicators
 - Improved UI responsiveness
 """
-
 import sys
 import time
 import threading
@@ -34,6 +33,10 @@ from core.computer_manager import ComputerManager
 from network.server import SocketServer
 from models.computer import Computer
 from utils.logger import LoggerSetup
+
+# New imports for activity DB and dialog
+from utils.activity_db import init_db
+from ui.activity_window import ActivityWindow
 
 logger = LoggerSetup.get_logger(__name__)
 
@@ -84,6 +87,11 @@ class MainWindow(QMainWindow):
 
         # Progress dialogs for file transfers
         self.progress_dialogs = {}
+
+        # init activity DB
+        init_db()
+        # track open activity windows: client_id -> ActivityWindow
+        self.open_activity_windows = {}
 
         logger.info("Starting Socket Server")
         self.server = SocketServer(
@@ -181,7 +189,7 @@ class MainWindow(QMainWindow):
             
             self.ui.tableWidget.setItem(row, col, item)
 
-        # Disconnect button
+        # Disconnect or reconnect button
         if computer.status == "Online":
             btn = QPushButton("Ngắt kết nối")
             btn.clicked.connect(lambda _, c=computer: self.disconnect_client(c))
@@ -248,6 +256,13 @@ class MainWindow(QMainWindow):
 
             elif packet_type == "PING" and len(parts) >= 2:
                 self._handle_ping_packet(parts)
+
+            elif packet_type == "ACTIVITY" and len(parts) >= 2:
+                # Server already persisted activity entries into DB.
+                # If an ActivityWindow is open for this client, refresh it.
+                client_id = parts[1]
+                if client_id in self.open_activity_windows:
+                    QTimer.singleShot(0, lambda cid=client_id: self.open_activity_windows[cid].reload_history())
 
         except Exception as e:
             logger.error(f"Error processing packet: {e}", exc_info=True)
@@ -335,23 +350,12 @@ class MainWindow(QMainWindow):
             logger.error(f"Error disconnecting client: {e}")
             QMessageBox.critical(self, "Lỗi", f"Lỗi khi ngắt kết nối: {str(e)}")
 
-    # === THÊM CHÍNH XÁC HÀM NÀY VÀO ĐÂY ĐỂ HẾT LỖI ATTRIBUTEERROR ===
-    def reconnect_client(self, computer):
-        """Xử lý khi click kết nối lại máy trạm"""
-        try:
-            self.ui.text_log.append(f"Đang yêu cầu {computer.name} kết nối lại...")
-            # Nếu bạn có thêm cờ chặn computer.is_blocked = False thì xử lý tại đây
-            self.refresh_table()
-        except Exception as e:
-            logger.error(f"Error reconnecting client: {e}")
-
     def reconnect_client(self, computer):
         """Xử lý khi bấm nút Kết nối lại"""
         computer.is_blocked = False # Gỡ chặn
         self.ui.text_log.append(f"Đã cho phép {computer.name} kết nối lại. Đang đợi...")
         self.signals.client_status_changed.emit()
         # Client đang tự động reconnect mỗi 5s, nên sẽ chui vào ngay lập tức sau thao tác này
-
 
     def start_timeout_checker(self):
         """Start timeout checker thread"""
@@ -451,7 +455,8 @@ class MainWindow(QMainWindow):
         label_ping.setStyleSheet("color:#CBD5E1;")
 
         btn = QPushButton("Điều khiển")
-        btn.clicked.connect(lambda _, c=computer: self.open_monitor(c))
+        # open ActivityWindow for this client (page_computers)
+        btn.clicked.connect(lambda _, c=computer: self.open_activity_window(c))
         btn.setStyleSheet("""
             QPushButton{
                 background-color:#2563EB;
@@ -475,13 +480,40 @@ class MainWindow(QMainWindow):
 
         return card
 
+    def open_activity_window(self, computer):
+        """Open the ActivityWindow for a client (reuse if already open)."""
+        existing = self.open_activity_windows.get(computer.client_id)
+        if existing:
+            try:
+                existing.raise_()
+                existing.activateWindow()
+            except Exception:
+                pass
+            return
+
+        w = ActivityWindow(self, computer.client_id, computer.name, self.server)
+        self.open_activity_windows[computer.client_id] = w
+
+        def on_close(result=0, cid=computer.client_id):
+            try:
+                del self.open_activity_windows[cid]
+            except KeyError:
+                pass
+
+        try:
+            w.finished.connect(on_close)
+        except Exception:
+            try:
+                w.destroyed.connect(lambda _: on_close())
+            except Exception:
+                pass
+
+        w.show()
+
     def open_monitor(self, computer):
-        """Open monitor page for selected computer"""
+        """Open monitor page for selected computer (kept if needed)"""
         self.selected_computer = computer
         self.switch_page(2, "Điều khiển")
-        
-        # self.ui.label_15.setText(f"🖥 {computer.name}") 
-        
         logger.info(f"Opened monitor for: {computer.name}")
 
     def update_screen_preview(self, image_data):
